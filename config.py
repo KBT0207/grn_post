@@ -29,3 +29,6 @@ COLUMNS = {
 
 # How dates are written in the source Excel, e.g. "01-04-2026"
 DATE_INPUT_FORMAT = "%d-%m-%Y"
+# DATE_INPUT_FORMAT = "%Y-%m-%d"
+
+

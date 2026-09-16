@@ -61,4 +61,4 @@ def main(excel_path: str, company: str = "", url: str = TALLY_URL):
 
 
 if __name__ == "__main__":
-    main("sample_grn.xlsx")
+    main("sample_grn1.xlsx")

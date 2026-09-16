@@ -1,3 +1,4 @@
+import pandas as pd
 import re
 from datetime import datetime
 
@@ -12,8 +13,23 @@ def xml_escape(value) -> str:
     return _ESCAPE_RE.sub(lambda m: _XML_ESCAPES[m.group(0)], text)
 
 
-def to_tally_date(date_str: str, input_format: str = DATE_INPUT_FORMAT) -> str:
-    return datetime.strptime(str(date_str).strip(), input_format).strftime("%Y%m%d")
+
+def to_tally_date(date_str, input_format="%d-%m-%Y"):
+    # Case 1: already a real datetime/Timestamp (typical when Excel col is date-formatted)
+    if isinstance(date_str, (datetime, pd.Timestamp)):
+        return date_str.strftime("%Y%m%d")
+
+    # Case 2: it's a string — strip time portion if present, then try formats
+    s = str(date_str).strip()
+
+    # If it looks like '2026-09-16 00:00:00' or '2026-09-16', handle ISO directly
+    for fmt in (input_format, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y%m%d")
+        except ValueError:
+            continue
+
+    raise ValueError(f"Unrecognized date format: {date_str!r}")
 
 
 def _fmt_qty(qty: float, unit: str) -> str:
