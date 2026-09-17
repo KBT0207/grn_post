@@ -60,5 +60,6 @@ def main(excel_path: str, company: str = "", url: str = TALLY_URL):
     print("=" * 60)
 
 
+path1 = r"C:\Users\kaybe\Desktop\tejas\sample_grn1.xlsx"
 if __name__ == "__main__":
-    main("sample_grn1.xlsx")
+    main(path1)

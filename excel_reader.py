@@ -37,9 +37,16 @@ def read_grn_excel(path: str, sheet_name=0) -> pd.DataFrame:
 
     errors = []
 
-    bad_numeric = df[df["qty"].isna() | df["rate"].isna() | df["amount"].isna()]
-    if not bad_numeric.empty:
-        errors.append(f"Non-numeric Qty/Rate/Amount in Excel row(s): {[i + 2 for i in bad_numeric.index]}")
+    # Qty must always be a real number - Tally can't post a line with no quantity.
+    bad_qty = df[df["qty"].isna()]
+    if not bad_qty.empty:
+        errors.append(f"Non-numeric/blank Qty in Excel row(s): {[i + 2 for i in bad_qty.index]}")
+
+    # Rate/Amount are allowed to be blank or zero (e.g. free-of-cost items,
+    # samples, complimentary stock) - blank cells default to 0 rather than
+    # blocking the whole import.
+    df["rate"] = df["rate"].fillna(0)
+    df["amount"] = df["amount"].fillna(0)
 
     for field, label in (
         ("voucher_no", "Receipt No"),
