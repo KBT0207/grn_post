@@ -1,14 +1,10 @@
 """
-GRN Excel -> Tally (XML) Importer
-==================================
-Single-file version. Run as:
+GRN Excel -> Tally (XML) Importer  (single-file version, with Tax Ledger support)
+=================================================================================
+Run as:
 
-    python grn_import.py path/to/sample_grn1.xlsx
+    python grn_import.py path/to/sample_grn_with_tax.xlsx
     python grn_import.py path/to/file.xlsx --company "My Company" --url http://localhost:9000
-
-Everything (config, Excel reading, XML building, Tally posting, and the
-main entry point) lives in this one file, organized into clearly marked
-sections below.
 """
 
 import os
@@ -51,7 +47,17 @@ COLUMNS = {
     "amount": "Amount",
     "godown": "Godown",
     "narration": "Narration",
+    "tax_ledger": "Tax Ledger",     # NEW (optional column)
+    "tax_amount": "Tax Amount",     # NEW (optional column)
+    "total_amount": "Total Amount", # NEW (optional column) voucher total = items + tax
 }
+
+# Columns that may be missing from the sheet entirely (older sheets still work).
+OPTIONAL_FIELDS = ("tax_ledger", "tax_amount", "total_amount")
+
+# XML tag used for the tax-ledger and party-total lines inside the voucher. If Tally ignores the
+# tax line, try "ALLLEDGERENTRIES.LIST" here instead.
+TAX_ENTRY_TAG = "LEDGERENTRIES.LIST"
 
 # How dates are written in the source Excel, e.g. "01-04-2026"
 DATE_INPUT_FORMAT = "%d-%m-%Y"
@@ -62,13 +68,14 @@ DATE_INPUT_FORMAT = "%d-%m-%Y"
 # SECTION 2: EXCEL READING
 # ============================================================================
 
-REQUIRED_HEADERS = list(COLUMNS.values())
+REQUIRED_HEADERS = [h for f, h in COLUMNS.items() if f not in OPTIONAL_FIELDS]
 
 _TEXT_FIELDS = (
     "voucher_type", "voucher_no", "date", "reference_no", "party_name",
     "purchase_ledger", "item_name", "unit", "tracking_no", "godown", "narration",
+    "tax_ledger",
 )
-_NUMERIC_FIELDS = ("qty", "rate", "amount")
+_NUMERIC_FIELDS = ("qty", "rate", "amount", "tax_amount", "total_amount")
 
 
 def read_grn_excel(path: str, sheet_name=0) -> pd.DataFrame:
@@ -84,7 +91,12 @@ def read_grn_excel(path: str, sheet_name=0) -> pd.DataFrame:
             f"Found columns: {list(df.columns)}"
         )
 
-    df = df[REQUIRED_HEADERS].copy()
+    # Optional columns (tax): create empty ones if the sheet doesn't have them.
+    for f in OPTIONAL_FIELDS:
+        if COLUMNS[f] not in df.columns:
+            df[COLUMNS[f]] = None
+
+    df = df[list(COLUMNS.values())].copy()
     df = df.rename(columns={header: field for field, header in COLUMNS.items()})
 
     df = df.dropna(how="all").reset_index(drop=True)
@@ -97,9 +109,24 @@ def read_grn_excel(path: str, sheet_name=0) -> pd.DataFrame:
 
     errors = []
 
-    bad_numeric = df[df["qty"].isna() | df["rate"].isna() | df["amount"].isna()]
-    if not bad_numeric.empty:
-        errors.append(f"Non-numeric Qty/Rate/Amount in Excel row(s): {[i + 2 for i in bad_numeric.index]}")
+    # Qty must always be a real number - Tally can't post a line with no quantity.
+    bad_qty = df[df["qty"].isna()]
+    if not bad_qty.empty:
+        errors.append(f"Non-numeric/blank Qty in Excel row(s): {[i + 2 for i in bad_qty.index]}")
+
+    # Rate/Amount/Tax Amount are allowed to be blank or zero (e.g. free-of-cost
+    # items, samples, no-tax rows) - blank cells default to 0.
+    df["rate"] = df["rate"].fillna(0)
+    df["amount"] = df["amount"].fillna(0)
+    df["tax_amount"] = df["tax_amount"].fillna(0)
+    df["total_amount"] = df["total_amount"].fillna(0)
+
+    # A tax amount with no ledger name can't be posted.
+    bad_tax = df[(df["tax_amount"] != 0) & (df["tax_ledger"] == "")]
+    if not bad_tax.empty:
+        errors.append(
+            f"Tax Amount given but Tax Ledger blank in Excel row(s): {[i + 2 for i in bad_tax.index]}"
+        )
 
     for field, label in (
         ("voucher_no", "Receipt No"),
@@ -136,6 +163,26 @@ def group_vouchers(df: pd.DataFrame) -> list[dict]:
 
         narration = next((n for n in group["narration"] if n), "")
 
+        # Tax ledgers for this voucher: {ledger name: total amount}.
+        # Enter the tax once per voucher; repeated rows of the same ledger add up.
+        taxes = {}
+        for _, r in group.iterrows():
+            if r["tax_ledger"] and r["tax_amount"]:
+                taxes[r["tax_ledger"]] = taxes.get(r["tax_ledger"], 0) + float(r["tax_amount"])
+
+        # Voucher total = items + tax. The Excel "Total Amount" (entered once per
+        # voucher) must agree with it; if left blank the calculated value is used.
+        items_total = float(group["amount"].sum())
+        calc_total = round(items_total + sum(taxes.values()), 2)
+        excel_total = round(float(group["total_amount"].sum()), 2)
+        if excel_total and abs(excel_total - calc_total) > 0.01:
+            raise ValueError(
+                f"Voucher {voucher_no!r} (Date {date_str}): Total Amount in Excel is "
+                f"{excel_total:.2f} but items + tax = {calc_total:.2f} "
+                f"(items {items_total:.2f} + tax {sum(taxes.values()):.2f})."
+            )
+        total = excel_total or calc_total
+
         vouchers.append({
             "voucher_type": voucher_type,
             "voucher_no": voucher_no,
@@ -145,6 +192,8 @@ def group_vouchers(df: pd.DataFrame) -> list[dict]:
             "tracking_no": tracking_nos[0],
             "narration": narration,
             "items": group.to_dict("records"),
+            "taxes": taxes,
+            "total": total,
         })
 
     return vouchers
@@ -163,12 +212,13 @@ def xml_escape(value) -> str:
     return _ESCAPE_RE.sub(lambda m: _XML_ESCAPES[m.group(0)], text)
 
 
+
 def to_tally_date(date_str, input_format=DATE_INPUT_FORMAT):
     # Case 1: already a real datetime/Timestamp (typical when Excel col is date-formatted)
     if isinstance(date_str, (datetime, pd.Timestamp)):
         return date_str.strftime("%Y%m%d")
 
-    # Case 2: it's a string - strip time portion if present, then try formats
+    # Case 2: it's a string — strip time portion if present, then try formats
     s = str(date_str).strip()
 
     # If it looks like '2026-09-16 00:00:00' or '2026-09-16', handle ISO directly
@@ -225,15 +275,51 @@ def build_inventory_entry(item: dict) -> str:
         </ALLINVENTORYENTRIES.LIST>"""
 
 
+def build_tax_entry(ledger: str, amount: float) -> str:
+    # Same sign convention as the item lines: ISDEEMEDPOSITIVE=Yes, negative AMOUNT.
+    # If Tally shows the wrong sign, flip it here.
+    neg_amount = _fmt_amount(-float(amount))
+
+    return f"""        <{TAX_ENTRY_TAG}>
+            <LEDGERNAME>{xml_escape(ledger)}</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+            <LEDGERFROMITEM>No</LEDGERFROMITEM>
+            <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+            <ISPARTYLEDGER>No</ISPARTYLEDGER>
+            <ISLASTDEEMEDPOSITIVE>Yes</ISLASTDEEMEDPOSITIVE>
+            <AMOUNT>{neg_amount}</AMOUNT>
+        </{TAX_ENTRY_TAG}>"""
+
+
+def build_party_entry(party: str, total: float) -> str:
+    # Party (supplier) ledger line carrying the voucher TOTAL (items + tax).
+    # Opposite sign to the item/tax lines, so the voucher balances.
+    return f"""        <{TAX_ENTRY_TAG}>
+            <LEDGERNAME>{xml_escape(party)}</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+            <LEDGERFROMITEM>No</LEDGERFROMITEM>
+            <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+            <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+            <ISLASTDEEMEDPOSITIVE>No</ISLASTDEEMEDPOSITIVE>
+            <AMOUNT>{_fmt_amount(float(total))}</AMOUNT>
+        </{TAX_ENTRY_TAG}>"""
+
+
 def build_voucher(voucher: dict) -> str:
     date_tally = to_tally_date(voucher["date"])
     entries = "\n".join(build_inventory_entry(item) for item in voucher["items"])
+    # Tax ledger lines, posted right after the item lines.
+    tax_entries = "\n".join(
+        build_tax_entry(name, amt) for name, amt in voucher.get("taxes", {}).items()
+    )
 
     # Receipt Note is a plain inventory voucher (not Invoice mode), and this
     # company's GRNs are routinely posted with no party attached yet - so
     # only emit the party tags when a Party A/c Name was actually given.
     party_block = ""
+    party_total_entry = ""
     if voucher["party_name"]:
+        party_total_entry = build_party_entry(voucher["party_name"], voucher.get("total", 0)) + "\n"
         party_block = (
             f"        <PARTYLEDGERNAME>{xml_escape(voucher['party_name'])}</PARTYLEDGERNAME>\n"
             f"        <PARTYNAME>{xml_escape(voucher['party_name'])}</PARTYNAME>\n"
@@ -247,7 +333,8 @@ def build_voucher(voucher: dict) -> str:
         <VOUCHERNUMBER>{xml_escape(voucher['voucher_no'])}</VOUCHERNUMBER>
         <REFERENCE>{xml_escape(voucher['reference_no'])}</REFERENCE>
 {party_block}        <NARRATION>{xml_escape(voucher['narration'])}</NARRATION>
-{entries}
+{party_total_entry}{entries}
+{tax_entries}
       </VOUCHER>
     </TALLYMESSAGE>"""
 
@@ -332,7 +419,7 @@ def main(excel_path: str, company: str = "", url: str = TALLY_URL):
         return
 
     total_items = len(df)
-    total_amount = sum(item["amount"] for v in vouchers for item in v["items"])
+    total_amount = sum(v["total"] for v in vouchers)
 
     print("=" * 60)
     print(f"GRN Import Started")
@@ -348,7 +435,7 @@ def main(excel_path: str, company: str = "", url: str = TALLY_URL):
 
     for idx, v in enumerate(vouchers, start=1):
         item_count = len(v["items"])
-        voucher_amount = sum(item["amount"] for item in v["items"])
+        voucher_amount = v["total"]
 
         print(f"\n[{idx}/{len(vouchers)}] Voucher {v['voucher_no']}  "
               f"(Date: {v['date']}, Party: {v['party_name'] or '-'}, "
