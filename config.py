@@ -25,10 +25,18 @@ COLUMNS = {
     "amount": "Amount",
     "godown": "Godown",
     "narration": "Narration",
+    "tax_ledger": "Tax Ledger",     # NEW (optional column)
+    "tax_amount": "Tax Amount",     # NEW (optional column)
+    "total_amount": "Total Amount", # NEW (optional column) voucher total = items + tax
 }
+
+# Columns that may be missing from the sheet entirely (older sheets still work).
+OPTIONAL_FIELDS = ("tax_ledger", "tax_amount", "total_amount")
+
+# XML tag used for the tax-ledger and party-total lines inside the voucher. If Tally ignores the
+# tax line, try "ALLLEDGERENTRIES.LIST" here instead.
+TAX_ENTRY_TAG = "LEDGERENTRIES.LIST"
 
 # How dates are written in the source Excel, e.g. "01-04-2026"
 DATE_INPUT_FORMAT = "%d-%m-%Y"
 # DATE_INPUT_FORMAT = "%Y-%m-%d"
-
-

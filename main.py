@@ -13,7 +13,7 @@ def main(excel_path: str, company: str = "", url: str = TALLY_URL):
         return
 
     total_items = len(df)
-    total_amount = sum(item["amount"] for v in vouchers for item in v["items"])
+    total_amount = sum(v["total"] for v in vouchers)
 
     print("=" * 60)
     print(f"GRN Import Started")
@@ -29,7 +29,7 @@ def main(excel_path: str, company: str = "", url: str = TALLY_URL):
 
     for idx, v in enumerate(vouchers, start=1):
         item_count = len(v["items"])
-        voucher_amount = sum(item["amount"] for item in v["items"])
+        voucher_amount = v["total"]
 
         print(f"\n[{idx}/{len(vouchers)}] Voucher {v['voucher_no']}  "
               f"(Date: {v['date']}, Party: {v['party_name'] or '-'}, "
@@ -60,6 +60,6 @@ def main(excel_path: str, company: str = "", url: str = TALLY_URL):
     print("=" * 60)
 
 
-path1 = r"C:\Users\kaybe\Desktop\tejas\sample_grn1.xlsx"
+path1 = "sample_grn_with_tax.xlsx"
 if __name__ == "__main__":
     main(path1)

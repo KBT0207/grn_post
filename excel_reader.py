@@ -1,14 +1,15 @@
 import pandas as pd
 
-from config import COLUMNS
+from config import COLUMNS, OPTIONAL_FIELDS
 
-REQUIRED_HEADERS = list(COLUMNS.values())
+REQUIRED_HEADERS = [h for f, h in COLUMNS.items() if f not in OPTIONAL_FIELDS]
 
 _TEXT_FIELDS = (
     "voucher_type", "voucher_no", "date", "reference_no", "party_name",
     "purchase_ledger", "item_name", "unit", "tracking_no", "godown", "narration",
+    "tax_ledger",
 )
-_NUMERIC_FIELDS = ("qty", "rate", "amount")
+_NUMERIC_FIELDS = ("qty", "rate", "amount", "tax_amount", "total_amount")
 
 
 def read_grn_excel(path: str, sheet_name=0) -> pd.DataFrame:
@@ -24,7 +25,12 @@ def read_grn_excel(path: str, sheet_name=0) -> pd.DataFrame:
             f"Found columns: {list(df.columns)}"
         )
 
-    df = df[REQUIRED_HEADERS].copy()
+    # Optional columns (tax): create empty ones if the sheet doesn't have them.
+    for f in OPTIONAL_FIELDS:
+        if COLUMNS[f] not in df.columns:
+            df[COLUMNS[f]] = None
+
+    df = df[list(COLUMNS.values())].copy()
     df = df.rename(columns={header: field for field, header in COLUMNS.items()})
 
     df = df.dropna(how="all").reset_index(drop=True)
@@ -42,11 +48,19 @@ def read_grn_excel(path: str, sheet_name=0) -> pd.DataFrame:
     if not bad_qty.empty:
         errors.append(f"Non-numeric/blank Qty in Excel row(s): {[i + 2 for i in bad_qty.index]}")
 
-    # Rate/Amount are allowed to be blank or zero (e.g. free-of-cost items,
-    # samples, complimentary stock) - blank cells default to 0 rather than
-    # blocking the whole import.
+    # Rate/Amount/Tax Amount are allowed to be blank or zero (e.g. free-of-cost
+    # items, samples, no-tax rows) - blank cells default to 0.
     df["rate"] = df["rate"].fillna(0)
     df["amount"] = df["amount"].fillna(0)
+    df["tax_amount"] = df["tax_amount"].fillna(0)
+    df["total_amount"] = df["total_amount"].fillna(0)
+
+    # A tax amount with no ledger name can't be posted.
+    bad_tax = df[(df["tax_amount"] != 0) & (df["tax_ledger"] == "")]
+    if not bad_tax.empty:
+        errors.append(
+            f"Tax Amount given but Tax Ledger blank in Excel row(s): {[i + 2 for i in bad_tax.index]}"
+        )
 
     for field, label in (
         ("voucher_no", "Receipt No"),
@@ -83,6 +97,26 @@ def group_vouchers(df: pd.DataFrame) -> list[dict]:
 
         narration = next((n for n in group["narration"] if n), "")
 
+        # Tax ledgers for this voucher: {ledger name: total amount}.
+        # Enter the tax once per voucher; repeated rows of the same ledger add up.
+        taxes = {}
+        for _, r in group.iterrows():
+            if r["tax_ledger"] and r["tax_amount"]:
+                taxes[r["tax_ledger"]] = taxes.get(r["tax_ledger"], 0) + float(r["tax_amount"])
+
+        # Voucher total = items + tax. The Excel "Total Amount" (entered once per
+        # voucher) must agree with it; if left blank the calculated value is used.
+        items_total = float(group["amount"].sum())
+        calc_total = round(items_total + sum(taxes.values()), 2)
+        excel_total = round(float(group["total_amount"].sum()), 2)
+        if excel_total and abs(excel_total - calc_total) > 0.01:
+            raise ValueError(
+                f"Voucher {voucher_no!r} (Date {date_str}): Total Amount in Excel is "
+                f"{excel_total:.2f} but items + tax = {calc_total:.2f} "
+                f"(items {items_total:.2f} + tax {sum(taxes.values()):.2f})."
+            )
+        total = excel_total or calc_total
+
         vouchers.append({
             "voucher_type": voucher_type,
             "voucher_no": voucher_no,
@@ -92,6 +126,8 @@ def group_vouchers(df: pd.DataFrame) -> list[dict]:
             "tracking_no": tracking_nos[0],
             "narration": narration,
             "items": group.to_dict("records"),
+            "taxes": taxes,
+            "total": total,
         })
 
     return vouchers

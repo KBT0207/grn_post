@@ -2,7 +2,7 @@ import pandas as pd
 import re
 from datetime import datetime
 
-from config import DATE_INPUT_FORMAT
+from config import DATE_INPUT_FORMAT, TAX_ENTRY_TAG
 
 _XML_ESCAPES = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;"}
 _ESCAPE_RE = re.compile("|".join(re.escape(c) for c in _XML_ESCAPES))
@@ -76,15 +76,51 @@ def build_inventory_entry(item: dict) -> str:
         </ALLINVENTORYENTRIES.LIST>"""
 
 
+def build_tax_entry(ledger: str, amount: float) -> str:
+    # Same sign convention as the item lines: ISDEEMEDPOSITIVE=Yes, negative AMOUNT.
+    # If Tally shows the wrong sign, flip it here.
+    neg_amount = _fmt_amount(-float(amount))
+
+    return f"""        <{TAX_ENTRY_TAG}>
+            <LEDGERNAME>{xml_escape(ledger)}</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+            <LEDGERFROMITEM>No</LEDGERFROMITEM>
+            <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+            <ISPARTYLEDGER>No</ISPARTYLEDGER>
+            <ISLASTDEEMEDPOSITIVE>Yes</ISLASTDEEMEDPOSITIVE>
+            <AMOUNT>{neg_amount}</AMOUNT>
+        </{TAX_ENTRY_TAG}>"""
+
+
+def build_party_entry(party: str, total: float) -> str:
+    # Party (supplier) ledger line carrying the voucher TOTAL (items + tax).
+    # Opposite sign to the item/tax lines, so the voucher balances.
+    return f"""        <{TAX_ENTRY_TAG}>
+            <LEDGERNAME>{xml_escape(party)}</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+            <LEDGERFROMITEM>No</LEDGERFROMITEM>
+            <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+            <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+            <ISLASTDEEMEDPOSITIVE>No</ISLASTDEEMEDPOSITIVE>
+            <AMOUNT>{_fmt_amount(float(total))}</AMOUNT>
+        </{TAX_ENTRY_TAG}>"""
+
+
 def build_voucher(voucher: dict) -> str:
     date_tally = to_tally_date(voucher["date"])
     entries = "\n".join(build_inventory_entry(item) for item in voucher["items"])
+    # Tax ledger lines, posted right after the item lines.
+    tax_entries = "\n".join(
+        build_tax_entry(name, amt) for name, amt in voucher.get("taxes", {}).items()
+    )
 
     # Receipt Note is a plain inventory voucher (not Invoice mode), and this
     # company's GRNs are routinely posted with no party attached yet - so
     # only emit the party tags when a Party A/c Name was actually given.
     party_block = ""
+    party_total_entry = ""
     if voucher["party_name"]:
+        party_total_entry = build_party_entry(voucher["party_name"], voucher.get("total", 0)) + "\n"
         party_block = (
             f"        <PARTYLEDGERNAME>{xml_escape(voucher['party_name'])}</PARTYLEDGERNAME>\n"
             f"        <PARTYNAME>{xml_escape(voucher['party_name'])}</PARTYNAME>\n"
@@ -98,7 +134,8 @@ def build_voucher(voucher: dict) -> str:
         <VOUCHERNUMBER>{xml_escape(voucher['voucher_no'])}</VOUCHERNUMBER>
         <REFERENCE>{xml_escape(voucher['reference_no'])}</REFERENCE>
 {party_block}        <NARRATION>{xml_escape(voucher['narration'])}</NARRATION>
-{entries}
+{party_total_entry}{entries}
+{tax_entries}
       </VOUCHER>
     </TALLYMESSAGE>"""
 
